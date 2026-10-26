@@ -10,10 +10,13 @@ import argparse
 import concurrent.futures
 import json
 import sys
+import threading
 import time
 import urllib3
 from datetime import datetime
 from pathlib import Path
+
+_depth_lock = threading.Lock()
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -90,20 +93,23 @@ def scan_target(target: str, args) -> ScanResult:
             result.pages = pages
             exploitable_pages = filter_exploitable_pages(pages, False)
 
-        # depth override
-        depths = [args.depth] if getattr(args, "depth", 0) else TRAVERSAL_DEPTHS[:]
-        original = TRAVERSAL_DEPTHS[:]
-        TRAVERSAL_DEPTHS.clear()
-        TRAVERSAL_DEPTHS.extend(depths)
-
-        # Phase 5
-        lfi_result = scan_lfi(session, target, exploitable_pages, themes,
-                               getattr(args, "port", 0),
-                               getattr(args, "threads", DEFAULT_THREADS), False)
+        # Phase 5 — use lock only when depth override needed, else use default
+        import poc as _poc
+        if getattr(args, "depth", 0):
+            with _depth_lock:
+                depths_backup = _poc.TRAVERSAL_DEPTHS[:]
+                _poc.TRAVERSAL_DEPTHS[:] = [args.depth]
+                try:
+                    lfi_result = scan_lfi(session, target, exploitable_pages, themes,
+                                          getattr(args, "port", 0),
+                                          getattr(args, "threads", DEFAULT_THREADS), False)
+                finally:
+                    _poc.TRAVERSAL_DEPTHS[:] = depths_backup
+        else:
+            lfi_result = scan_lfi(session, target, exploitable_pages, themes,
+                                   getattr(args, "port", 0),
+                                   getattr(args, "threads", DEFAULT_THREADS), False)
         result.lfi = lfi_result
-
-        TRAVERSAL_DEPTHS.clear()
-        TRAVERSAL_DEPTHS.extend(original)
 
         if lfi_result and lfi_result.waf_blocked:
             result.waf_detected = True
