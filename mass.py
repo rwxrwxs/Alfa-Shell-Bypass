@@ -237,7 +237,7 @@ def main():
 
     total = len(targets)
     print(f"""
-╔═══════════════════════════════════════════════════════════════╗
+╬═══════════════════════════════════════════════════════════════╪
 ║  CVE-2026-87902 — WordPress LFI Mass Scanner                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 [*] Targets      : {total}
@@ -251,18 +251,39 @@ def main():
     completed = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.mass_threads) as ex:
-        future_map = {ex.submit(scan_target, t, args): t for t in targets}
-        for future in concurrent.futures.as_completed(future_map):
-            completed += 1
-            try:
-                result = future.result()
-            except Exception as e:
-                target = future_map[future]
-                result = ScanResult(target=target, server_header=f"ERROR: {e}")
-            results.append(result)
-            print_live(result, completed, total)
-            if args.delay > 0:
-                time.sleep(args.delay)
+        futures = {}
+        target_iter = iter(targets)
+        active = 0
+
+        # seed initial batch
+        for t in target_iter:
+            futures[ex.submit(scan_target, t, args)] = t
+            active += 1
+            if active >= args.mass_threads * 2:
+                break
+
+        while futures:
+            done, _ = concurrent.futures.wait(
+                futures, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in done:
+                completed += 1
+                t = futures.pop(future)
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = ScanResult(target=t, server_header=f"ERROR: {e}")
+                results.append(result)
+                print_live(result, completed, total)
+                if args.delay > 0:
+                    time.sleep(args.delay)
+
+                # submit next target
+                try:
+                    nt = next(target_iter)
+                    futures[ex.submit(scan_target, nt, args)] = nt
+                except StopIteration:
+                    pass
 
     # Summary
     vuln_count = sum(1 for r in results if r.lfi and r.lfi.confirmed)
