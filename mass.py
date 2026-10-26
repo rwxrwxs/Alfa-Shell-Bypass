@@ -157,7 +157,6 @@ def write_results(results: list[ScanResult], out_dir: Path, fmt: str):
     waf  = [r for r in results if r.waf_detected or (r.lfi and r.lfi.waf_blocked)]
     dead = [r for r in results if r not in vuln and r not in waf]
 
-    # Always write plain-text lists
     (out_dir / f"vuln_{ts}.txt").write_text(
         "\n".join(r.target for r in vuln) + "\n" if vuln else ""
     )
@@ -226,18 +225,24 @@ def main():
         print(f"[-] File not found: {args.targets}")
         sys.exit(1)
 
-    targets = [
-        line.strip() for line in target_file.read_text().splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    def iter_targets(path: Path):
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    yield line
 
-    if not targets:
+    print("[*] Counting targets...", end="", flush=True)
+    total = sum(1 for line in target_file.open()
+                if line.strip() and not line.strip().startswith("#"))
+    print(f" {total}")
+
+    if total == 0:
         print("[-] No targets found in file.")
         sys.exit(1)
 
-    total = len(targets)
     print(f"""
-╬═══════════════════════════════════════════════════════════════╪
+╔═══════════════════════════════════════════════════════════════╗
 ║  CVE-2026-87902 — WordPress LFI Mass Scanner                 ║
 ╚═══════════════════════════════════════════════════════════════╝
 [*] Targets      : {total}
@@ -250,9 +255,11 @@ def main():
     results: list[ScanResult] = []
     completed = 0
 
+    print("[*] Starting scan...\n")
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.mass_threads) as ex:
         futures = {}
-        target_iter = iter(targets)
+        target_iter = iter_targets(target_file)
         active = 0
 
         # seed initial batch
